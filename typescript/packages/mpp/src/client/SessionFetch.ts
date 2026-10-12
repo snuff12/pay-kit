@@ -576,7 +576,24 @@ export async function withPatchedGlobalFetch<Value>(
 
 // Authorization must be visible to preparation hooks without making inherited
 // Request headers an explicit override of a replacement input's headers.
-const inheritedRequestHeaders = new WeakMap<Headers, Headers>();
+const inheritedRequestHeaders = new WeakMap<Headers, { edited: Set<string>; headers: Headers }>();
+
+class InheritedHeaders extends Headers {
+    override append(...parameters: Parameters<Headers['append']>): void {
+        super.append(...parameters);
+        inheritedRequestHeaders.get(this)?.edited.add(String(parameters[0]).toLowerCase());
+    }
+
+    override delete(...parameters: Parameters<Headers['delete']>): void {
+        super.delete(...parameters);
+        inheritedRequestHeaders.get(this)?.edited.add(String(parameters[0]).toLowerCase());
+    }
+
+    override set(...parameters: Parameters<Headers['set']>): void {
+        super.set(...parameters);
+        inheritedRequestHeaders.get(this)?.edited.add(String(parameters[0]).toLowerCase());
+    }
+}
 
 function effectiveRequestHeaders(input: FetchInput, init: FetchInit): Headers {
     const provided = init?.headers;
@@ -586,13 +603,22 @@ function effectiveRequestHeaders(input: FetchInput, init: FetchInit): Headers {
     }
 
     const headers = new Headers(input instanceof Request ? input.headers : undefined);
-    for (const name of inherited.keys()) {
+    for (const name of inherited.headers.keys()) {
         if (!provided.has(name)) {
             headers.delete(name);
         }
     }
     for (const [name, value] of provided) {
-        if (value !== inherited.get(name)) {
+        if (value !== inherited.headers.get(name)) {
+            headers.set(name, value);
+        }
+    }
+    // Setting an unchanged value or deleting an absent header is still an edit.
+    for (const name of inherited.edited) {
+        const value = provided.get(name);
+        if (value === null) {
+            headers.delete(name);
+        } else {
             headers.set(name, value);
         }
     }
@@ -600,9 +626,10 @@ function effectiveRequestHeaders(input: FetchInput, init: FetchInit): Headers {
 }
 
 function withAuthorization(input: FetchInput, init: FetchInit, authorization: string): FetchInit {
-    const headers = effectiveRequestHeaders(input, init);
+    const inherited = effectiveRequestHeaders(input, init);
+    const headers = init?.headers === undefined ? new InheritedHeaders(inherited) : inherited;
     if (init?.headers === undefined) {
-        inheritedRequestHeaders.set(headers, new Headers(headers));
+        inheritedRequestHeaders.set(headers, { edited: new Set(), headers: inherited });
     }
     headers.set('authorization', authorization);
     return { ...init, headers };

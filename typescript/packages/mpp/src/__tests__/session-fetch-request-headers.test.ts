@@ -305,6 +305,38 @@ describe('SessionFetchClient request headers', () => {
         expect(attempts[1]!.headers.authorization).toMatch(/^Payment /);
     });
 
+    test('keeps an explicit in-place set even when the value matches an inherited header', async () => {
+        const { attempts, client } = createRecordingClient(request => {
+            const input = new Request(GATEWAY);
+            const headers = request.init?.headers instanceof Headers ? request.init.headers : input.headers;
+            headers.set('X-Secret', 'secret');
+            return { ...request, input };
+        });
+
+        const response = await client.fetch(callerRequest());
+
+        expect(response.status).toBe(200);
+        expect(attempts).toHaveLength(2);
+        expect(attempts[0]!.headers).toEqual({ 'x-secret': 'secret' });
+        expect(withoutAuthorization(attempts[1]!.headers)).toEqual(attempts[0]!.headers);
+    });
+
+    test('keeps an in-place deletion of a header owned only by the replacement input', async () => {
+        const { attempts, client } = createRecordingClient(request => {
+            const input = new Request(GATEWAY, { headers: { 'x-gateway-secret': 'gateway-secret' } });
+            const headers = request.init?.headers instanceof Headers ? request.init.headers : input.headers;
+            headers.delete('X-Gateway-Secret');
+            return { ...request, input };
+        });
+
+        const response = await client.fetch(callerRequest());
+
+        expect(response.status).toBe(200);
+        expect(attempts).toHaveLength(2);
+        expect(attempts[0]!.headers).toEqual({});
+        expect(withoutAuthorization(attempts[1]!.headers)).toEqual(attempts[0]!.headers);
+    });
+
     test.each([undefined, 'Bearer caller'])(
         'keeps in-place authorization removal with caller authorization %s',
         async authorization => {
