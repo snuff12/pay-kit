@@ -22,11 +22,13 @@ import {
 } from '../client/index.js';
 
 const BODY = JSON.stringify({ prompt: 'hello' });
+const GATEWAY = 'https://gateway.test/v1/work';
 const RESOURCE = 'https://api.test/v1/work';
 
 interface RecordedAttempt {
     readonly body: string;
     readonly headers: Record<string, string>;
+    readonly url: string;
 }
 
 function sessionChallenge(): SessionChallenge {
@@ -79,6 +81,7 @@ function createRecordingClient(prepareRequest?: PrepareSessionRequest) {
             attempts.push({
                 body: await request.text(),
                 headers: Object.fromEntries(request.headers.entries()),
+                url: request.url,
             });
             if (!request.headers.get('authorization')?.startsWith('Payment ')) {
                 return new Response(null, {
@@ -169,6 +172,162 @@ describe('SessionFetchClient request headers', () => {
 
         expect(headers).toEqual({ 'x-client-tag': 'tag' });
     });
+
+    test.each([
+        { createInput: () => GATEWAY, expectedHeaders: {}, label: 'URL string' },
+        { createInput: () => new URL(GATEWAY), expectedHeaders: {}, label: 'URL object' },
+        {
+            createInput: () => new Request(GATEWAY, { headers: { 'x-gateway-tag': 'gateway' } }),
+            expectedHeaders: { 'x-gateway-tag': 'gateway' },
+            label: 'Request',
+        },
+    ])(
+        'uses the headers of the $label returned by prepareRequest on both attempts',
+        async ({ createInput, expectedHeaders }) => {
+            const hookAuthorizations: (string | null)[] = [];
+            const { attempts, client } = createRecordingClient(request => {
+                hookAuthorizations.push(new Headers(request.init?.headers).get('authorization'));
+                return { ...request, input: createInput() };
+            });
+            const request = callerRequest();
+
+            const response = await client.fetch(request);
+
+            expect(response.status).toBe(200);
+            expect(attempts).toHaveLength(2);
+            expect(attempts.map(attempt => attempt.url)).toEqual([GATEWAY, GATEWAY]);
+            expect(attempts[0]!.headers).toEqual(expectedHeaders);
+            expect(withoutAuthorization(attempts[1]!.headers)).toEqual(expectedHeaders);
+            expect(hookAuthorizations).toEqual([null, expect.stringMatching(/^Payment /)]);
+            expect(request.bodyUsed).toBe(false);
+            expect(request.headers.get('x-secret')).toBe('secret');
+            expect(request.headers.has('authorization')).toBe(false);
+        },
+    );
+
+    test.each<{ headers: HeadersInit; label: string }>([
+        { headers: {}, label: 'empty object' },
+        { headers: new Headers(), label: 'empty Headers' },
+        { headers: [], label: 'empty list' },
+        { headers: { 'x-override': 'yes' }, label: 'replacement object' },
+    ])('lets $label init headers replace the Request returned by prepareRequest', async ({ headers }) => {
+        const { attempts, client } = createRecordingClient(request => ({
+            ...request,
+            input: new Request(GATEWAY, { headers: { 'x-gateway-tag': 'gateway' } }),
+        }));
+
+        const expected = Object.fromEntries(new Headers(headers).entries());
+        const response = await client.fetch(callerRequest(), { headers });
+
+        expect(response.status).toBe(200);
+        expect(attempts).toHaveLength(2);
+        expect(attempts[0]!.headers).toEqual(expected);
+        expect(withoutAuthorization(attempts[1]!.headers)).toEqual(expected);
+        expect(Object.fromEntries(new Headers(headers).entries())).toEqual(expected);
+    });
+
+    test('applies hook header changes once per attempt', async () => {
+        const { attempts, client } = createRecordingClient(request => {
+            const headers = new Headers(
+                request.init?.headers ?? (request.input instanceof Request ? request.input.headers : undefined),
+            );
+            headers.append('x-client-tag', 'prepared');
+            return { ...request, init: { ...request.init, headers } };
+        });
+
+        const response = await client.fetch(callerRequest());
+
+        expect(response.status).toBe(200);
+        expect(attempts).toHaveLength(2);
+        expect(attempts.map(attempt => attempt.headers['x-client-tag'])).toEqual(['tag, prepared', 'tag, prepared']);
+        expect(withoutAuthorization(attempts[1]!.headers)).toEqual(attempts[0]!.headers);
+    });
+
+    test.each(['before', 'after'] as const)(
+        'keeps header stripping %s input replacement consistent across attempts',
+        async order => {
+            const strip = stripRequestHeaders(['x-secret']);
+            const { attempts, client } = createRecordingClient(request =>
+                order === 'before' ? { ...strip(request), input: GATEWAY } : strip({ ...request, input: GATEWAY }),
+            );
+
+            const response = await client.fetch(callerRequest());
+
+            expect(response.status).toBe(200);
+            expect(attempts).toHaveLength(2);
+            expect(attempts.map(attempt => attempt.url)).toEqual([GATEWAY, GATEWAY]);
+            expect(attempts[0]!.headers).toEqual(
+                order === 'before' ? { 'content-type': 'application/json', 'x-client-tag': 'tag' } : {},
+            );
+            expect(withoutAuthorization(attempts[1]!.headers)).toEqual(attempts[0]!.headers);
+            expect(attempts[1]!.headers.authorization).toMatch(/^Payment /);
+        },
+    );
+
+    test('lets prepareRequest remove payment authorization from the paid retry', async () => {
+        const hookAuthorizations: (string | null)[] = [];
+        const strip = stripRequestHeaders(['authorization', 'x-secret']);
+        const { attempts, client } = createRecordingClient(request => {
+            hookAuthorizations.push(new Headers(request.init?.headers).get('authorization'));
+            return strip(request);
+        });
+
+        const response = await client.fetch(callerRequest());
+
+        expect(response.status).toBe(402);
+        expect(attempts).toHaveLength(2);
+        expect(hookAuthorizations).toEqual([null, expect.stringMatching(/^Payment /)]);
+        expect(attempts[1]!.headers).toEqual(attempts[0]!.headers);
+        for (const attempt of attempts) {
+            expect(attempt.headers.authorization).toBeUndefined();
+            expect(attempt.headers['x-secret']).toBeUndefined();
+            expect(attempt.headers).toMatchObject({ 'content-type': 'application/json', 'x-client-tag': 'tag' });
+        }
+    });
+
+    test('keeps in-place header edits when prepareRequest replaces the input', async () => {
+        const { attempts, client } = createRecordingClient(request => {
+            const input = new Request(GATEWAY, {
+                headers: { 'x-gateway-tag': 'gateway', 'x-secret': 'gateway-secret' },
+            });
+            const headers = request.init?.headers instanceof Headers ? request.init.headers : input.headers;
+            headers.delete('x-secret');
+            headers.set('x-client-tag', 'prepared');
+            return { ...request, input };
+        });
+
+        const response = await client.fetch(callerRequest());
+
+        expect(response.status).toBe(200);
+        expect(attempts).toHaveLength(2);
+        expect(attempts[0]!.headers).toEqual({ 'x-client-tag': 'prepared', 'x-gateway-tag': 'gateway' });
+        expect(withoutAuthorization(attempts[1]!.headers)).toEqual(attempts[0]!.headers);
+        expect(attempts[1]!.headers.authorization).toMatch(/^Payment /);
+    });
+
+    test.each([undefined, 'Bearer caller'])(
+        'keeps in-place authorization removal with caller authorization %s',
+        async authorization => {
+            const { attempts, client } = createRecordingClient(request => {
+                if (request.init?.headers instanceof Headers) {
+                    request.init.headers.delete('authorization');
+                }
+                return request;
+            });
+            const request = callerRequest();
+            if (authorization !== undefined) {
+                request.headers.set('authorization', authorization);
+            }
+
+            const response = await client.fetch(request);
+
+            expect(response.status).toBe(402);
+            expect(attempts).toHaveLength(2);
+            expect(withoutAuthorization(attempts[1]!.headers)).toEqual(withoutAuthorization(attempts[0]!.headers));
+            expect(attempts[1]!.headers.authorization).toBeUndefined();
+            expect(request.headers.get('authorization')).toBe(authorization ?? null);
+        },
+    );
 
     test('stripRequestHeaders removes only the named Request headers on both attempts', async () => {
         const { attempts, client } = createRecordingClient(stripRequestHeaders(['X-Secret']));

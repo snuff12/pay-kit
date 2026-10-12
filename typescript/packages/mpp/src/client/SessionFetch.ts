@@ -221,10 +221,22 @@ export class SessionFetchClient {
         await this.replaceOpenState(open);
         this.emit({ open, type: 'open' });
 
-        const retry = this.prepare({
-            init: withAuthorization(input, init, authorization),
-            input: cloneFetchInput(input),
-        });
+        const retryInit = withAuthorization(input, init, authorization);
+        let retry: PreparedFetchRequest;
+        try {
+            const preparedRetry = this.prepare({ init: retryInit, input: cloneFetchInput(input) });
+            retry = {
+                ...preparedRetry,
+                init: {
+                    ...preparedRetry.init,
+                    headers: effectiveRequestHeaders(preparedRetry.input, preparedRetry.init),
+                },
+            };
+        } finally {
+            if (retryInit?.headers instanceof Headers) {
+                inheritedRequestHeaders.delete(retryInit.headers);
+            }
+        }
         const retryResponse = await this.#fetch(retry.input, retry.init);
         this.emit({ response: retryResponse, type: 'retry' });
         return retryResponse;
@@ -562,12 +574,36 @@ export async function withPatchedGlobalFetch<Value>(
     }
 }
 
+// Authorization must be visible to preparation hooks without making inherited
+// Request headers an explicit override of a replacement input's headers.
+const inheritedRequestHeaders = new WeakMap<Headers, Headers>();
+
 function effectiveRequestHeaders(input: FetchInput, init: FetchInit): Headers {
-    return new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+    const provided = init?.headers;
+    const inherited = provided instanceof Headers ? inheritedRequestHeaders.get(provided) : undefined;
+    if (!inherited || !(provided instanceof Headers)) {
+        return new Headers(provided ?? (input instanceof Request ? input.headers : undefined));
+    }
+
+    const headers = new Headers(input instanceof Request ? input.headers : undefined);
+    for (const name of inherited.keys()) {
+        if (!provided.has(name)) {
+            headers.delete(name);
+        }
+    }
+    for (const [name, value] of provided) {
+        if (value !== inherited.get(name)) {
+            headers.set(name, value);
+        }
+    }
+    return headers;
 }
 
 function withAuthorization(input: FetchInput, init: FetchInit, authorization: string): FetchInit {
     const headers = effectiveRequestHeaders(input, init);
+    if (init?.headers === undefined) {
+        inheritedRequestHeaders.set(headers, new Headers(headers));
+    }
     headers.set('authorization', authorization);
     return { ...init, headers };
 }
